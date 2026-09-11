@@ -187,14 +187,15 @@ If a page under `settings/*` sets `Page.layout = { breadcrumbs: […] }`, those 
 
 | File | Purpose |
 |------|---------|
-| `layouts/app-layout.tsx` | Thin shim → forwards to `AppSidebarLayout`. |
-| `layouts/app/app-sidebar-layout.tsx` | Sidebar + main content + breadcrumb header. Used by everything under `/` and `/settings/*` except auth. |
+| `layouts/app-layout.tsx` | Thin shim → forwards to `AppSidebarLayout`. Rename to `admin-layout.tsx` once you split admin/frontend (see recipe below). |
+| `layouts/app/app-sidebar-layout.tsx` | Sidebar + main content + breadcrumb header. Used by everything under `/` and `/settings/*` except auth. Becomes the admin shell after the split. |
 | `layouts/app/app-header-layout.tsx` | Alternative shell with a top header instead of a sidebar. Not currently wired up by the resolver. |
-| `layouts/auth-layout.tsx` | Thin shim → forwards to `AuthSimpleLayout`. |
+| `layouts/auth-layout.tsx` | Thin shim → forwards to `AuthSimpleLayout`. Unchanged by the admin/frontend split. |
 | `layouts/auth/auth-simple-layout.tsx` | Centered logo + title/description + children. Used by all `pages/auth/*`. |
 | `layouts/auth/auth-card-layout.tsx` | Card-style variant. Not currently wired up. |
 | `layouts/auth/auth-split-layout.tsx` | Two-column (image + form) variant. Not currently wired up. |
-| `layouts/settings/layout.tsx` | Sub-nav for /settings/*. |
+| `layouts/settings/layout.tsx` | Sub-nav for /settings/*. Stays inside the admin area post-split. |
+| `layouts/frontend-layout.tsx` *(to create)* | Public shell for marketing / homepage / any non-admin page. See recipe below. |
 
 ## Recipes
 
@@ -249,6 +250,141 @@ That's it. All `pages/auth/*` now use the card layout, and any `Page.layout = { 
    ```tsx
    Pricing.layout = { heroTitle: 'Pick a plan' };
    ```
+
+### Split the app into "admin" and "frontend" shells (keep auth as-is)
+
+Goal: the current sidebar-driven shell becomes the **admin** area (backoffice), and the public site gets its own **frontend** shell (marketing pages, homepage, etc.). Auth pages keep the existing `AuthLayout`.
+
+The mental model matches what's already in this doc: **one resolver, prefix-based routing to a layout component.** You're just adding a third bucket alongside `auth/`.
+
+#### 1. Rename the current app shell to "admin"
+
+Rename files so the intent is obvious to any future reader:
+
+```
+resources/js/layouts/app-layout.tsx           → admin-layout.tsx
+resources/js/layouts/app/                     → admin/
+resources/js/layouts/app/app-sidebar-layout.tsx  → admin/admin-sidebar-layout.tsx
+resources/js/layouts/app/app-header-layout.tsx   → admin/admin-header-layout.tsx
+```
+
+Update the internal import inside `admin-layout.tsx` (the shim) to point at `@/layouts/admin/admin-sidebar-layout`. Also update the export name (`AppLayout` → `AdminLayout`) and any references in `resources/js/app.tsx` and in pages that used to import `@/layouts/app-layout`.
+
+`SettingsLayout` (under `resources/js/layouts/settings/layout.tsx`) can stay where it is — it's a nested sub-nav that belongs to the admin area.
+
+#### 2. Create the new frontend layout
+
+Same two-file shim + template pattern used by `auth-layout.tsx` and (post-rename) `admin-layout.tsx`:
+
+```tsx
+// resources/js/layouts/frontend-layout.tsx
+import FrontendLayoutTemplate from '@/layouts/frontend/frontend-default-layout';
+
+export default function FrontendLayout({
+    title = '',
+    children,
+}: {
+    title?: string;
+    children: React.ReactNode;
+}) {
+    return <FrontendLayoutTemplate title={title}>{children}</FrontendLayoutTemplate>;
+}
+```
+
+```tsx
+// resources/js/layouts/frontend/frontend-default-layout.tsx
+import { Link } from '@inertiajs/react';
+import { home } from '@/routes';
+
+export default function FrontendDefaultLayout({
+    children,
+    title,
+}: {
+    children: React.ReactNode;
+    title?: string;
+}) {
+    return (
+        <div className="flex min-h-svh flex-col">
+            <header className="border-b p-4">
+                <Link href={home()} className="font-semibold">Brand</Link>
+                {/* public nav here */}
+            </header>
+            <main className="flex-1">{children}</main>
+            <footer className="border-t p-4 text-sm text-muted-foreground">© …</footer>
+        </div>
+    );
+}
+```
+
+Keep the shim thin (title/children props only, forwards to the template). Later you can add alternate templates (`frontend-landing-layout.tsx`, `frontend-docs-layout.tsx`) and swap the import line, same as with the auth templates.
+
+#### 3. Reorganise the pages folder by area
+
+```
+resources/js/pages/
+├── admin/
+│   ├── dashboard.tsx        ← was pages/dashboard.tsx
+│   └── settings/            ← was pages/settings/
+│       ├── profile.tsx
+│       ├── password.tsx
+│       └── appearance.tsx
+├── auth/                    ← unchanged
+│   └── …
+├── frontend/                ← new
+│   ├── home.tsx
+│   └── about.tsx
+└── welcome.tsx              ← keep or delete
+```
+
+Server-side, update the render names to match: `Inertia::render('admin/dashboard')`, `Inertia::render('frontend/home')`, etc. Route files usually change on the same line — nothing tricky, but do a grep for the old names.
+
+#### 4. Update the global resolver
+
+`resources/js/app.tsx`:
+
+```tsx
+import AdminLayout from '@/layouts/admin-layout';
+import AuthLayout from '@/layouts/auth-layout';
+import FrontendLayout from '@/layouts/frontend-layout';
+import SettingsLayout from '@/layouts/settings/layout';
+
+layout: (name) => {
+    switch (true) {
+        case name === 'welcome':
+            return null;
+        case name.startsWith('auth/'):
+            return AuthLayout;
+        case name.startsWith('admin/settings/'):
+            return [AdminLayout, SettingsLayout];
+        case name.startsWith('admin/'):
+            return AdminLayout;
+        default:
+            return FrontendLayout;
+    }
+},
+```
+
+Order matters: the more specific `admin/settings/` case must come **before** `admin/`. Auth still wins for `auth/*`. Everything not matched falls through to the frontend shell — that's what makes new public pages zero-boilerplate.
+
+#### 5. Per-page overrides still work
+
+The `Page.layout = { … }` object-prop mechanism from the top of this doc is layout-agnostic. A frontend page can do:
+
+```tsx
+Home.layout = { title: 'Welcome' };
+```
+
+…and `FrontendLayout` will receive `title="Welcome"` exactly the way `AuthLayout` receives `title` and `description` today. Just make sure the keys match the props the frontend layout accepts.
+
+#### Checklist
+
+- [ ] Renamed `app-layout.tsx` → `admin-layout.tsx` and updated its import + export name
+- [ ] Renamed `layouts/app/` → `layouts/admin/` and its two templates
+- [ ] Created `layouts/frontend-layout.tsx` (shim) and `layouts/frontend/frontend-default-layout.tsx` (template)
+- [ ] Moved admin pages under `pages/admin/`, created `pages/frontend/`
+- [ ] Updated every `Inertia::render('…')` server-side call to match new names
+- [ ] Updated the resolver in `resources/js/app.tsx` (auth → admin/settings → admin → frontend fallback)
+- [ ] Ran `npm run build` (or `composer run dev`) to catch stale import paths
 
 ### Opt a single page out of the layout
 
